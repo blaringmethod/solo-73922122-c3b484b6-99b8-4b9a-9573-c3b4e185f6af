@@ -3,12 +3,13 @@ from __future__ import annotations
 
 import json
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Response, status
+from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
 from . import __version__
 from .config import settings
-from .database import get_db
+from .database import SessionLocal, get_db
 from .schemas import (
     BatchSummaryOut,
     HealthOut,
@@ -19,13 +20,14 @@ from .schemas import (
 )
 from .services import (
     IdempotencyConflict,
-    get_registered_batch,
+    get_batch_meta,
     get_report,
     get_submission,
     list_registered_batches,
     ruleset_snapshot,
     submit_batch,
 )
+from .streaming import stream_registered_batch
 
 router = APIRouter()
 
@@ -69,13 +71,31 @@ def list_batches(db: Session = Depends(get_db)) -> list[BatchSummaryOut]:
     "/batches/{batch_id}",
     response_model=RegisteredBatchOut,
     tags=["batches"],
-    summary="下游读取已登记批次的明细数据（校验失败的批次返回 404）",
+    summary="下游读取已登记批次的明细数据（流式返回；校验失败的批次返回 404）",
 )
-def read_batch(batch_id: str, db: Session = Depends(get_db)) -> RegisteredBatchOut:
-    batch = get_registered_batch(db, batch_id)
-    if batch is None:
+def read_batch(batch_id: str) -> Response:
+    """流式输出批次明细。
+
+    元数据在短事务内先读取并立即关闭连接（未登记 -> 404 仍发生在响应开始前）；
+    明细按页读取、边读边编码边发送，单个读事务只覆盖一页数据。
+    """
+    db = SessionLocal()
+    try:
+        meta = get_batch_meta(db, batch_id)
+    finally:
+        db.close()
+
+    if meta is None:
         raise HTTPException(status_code=404, detail=f"批次 {batch_id} 未登记或未通过质量闸门")
-    return batch
+
+    return StreamingResponse(
+        stream_registered_batch(meta),
+        media_type="application/json",
+        headers={
+            "X-Content-Type-Options": "nosniff",
+            "Cache-Control": "no-store",
+        },
+    )
 
 
 @router.get(

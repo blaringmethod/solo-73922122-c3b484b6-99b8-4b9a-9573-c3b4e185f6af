@@ -9,9 +9,18 @@ services:
       DQG_DB_PATH: /data/dqg.db
       DQG_CATALOG_PATH: /app/data/rule_catalog.json
       DQG_SAMPLE_PATH: /app/data/sample_payloads.json
+      # 演示路由（/docs 中的“demo”分组）：大批次生成、慢速接收、中途失败、WAL 检查点
+      DQG_DEMO_ENABLED: "true"
+      # 流式读取：每页行数 / 每 chunk 字节数 / 首段最多行数
+      DQG_STREAM_PAGE_SIZE: "500"
+      DQG_STREAM_CHUNK_BYTES: "65536"
+      DQG_STREAM_FIRST_SEGMENT_RECORDS: "20"
     volumes:
       - dqg-data:/data
     restart: unless-stopped
+    # 流式响应需要较长的连接存活时间；此处只调大优雅退出等待，
+    # 避免 docker stop 时长时间等待慢速下游连接。
+    stop_grace_period: 15s
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health').status==200 else 1)"]
       interval: 30s

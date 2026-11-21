@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from sqlalchemy import select
@@ -146,6 +147,11 @@ def get_submission(db: Session, batch_id: str) -> SubmissionResponse | None:
 
 
 def get_registered_batch(db: Session, batch_id: str) -> RegisteredBatchOut | None:
+    """一次性加载完整批次（会占用与行数成正比的内存，仅供兼容/小批次使用）。
+
+    ``GET /batches/{batch_id}`` 已改用 :mod:`app.streaming` 的流式读取路径，
+    不再调用本函数。
+    """
     batch = db.get(Batch, batch_id)
     if batch is None:
         return None
@@ -159,6 +165,49 @@ def get_registered_batch(db: Session, batch_id: str) -> RegisteredBatchOut | Non
             for r in batch.records
         ],
     )
+
+
+@dataclass(frozen=True, slots=True)
+class BatchMeta:
+    """批次元数据；流式读取时先在短事务内取出，随后按页读明细。"""
+
+    batch_id: str
+    schema_version: str
+    record_count: int
+    registered_at: str
+
+
+def get_batch_meta(db: Session, batch_id: str) -> BatchMeta | None:
+    """只查批次头，不触发明细加载。"""
+    batch = db.get(Batch, batch_id)
+    if batch is None:
+        return None
+    return BatchMeta(
+        batch_id=batch.batch_id,
+        schema_version=batch.schema_version,
+        record_count=batch.record_count,
+        registered_at=_iso(batch.registered_at),
+    )
+
+
+def read_record_page(
+    db: Session, batch_id: str, after_index: int, limit: int
+) -> list[tuple[int, dict]]:
+    """按 record_index 升序读取一页明细。
+
+    ``after_index`` 为上一页最后一条的下标（首页传 -1）。用 keyset 分页而非
+    OFFSET：每次都是短事务内的小范围索引扫描，页与页之间不持有读事务。
+    """
+    rows = db.execute(
+        select(BatchRecord.record_index, BatchRecord.record_json)
+        .where(
+            BatchRecord.batch_id == batch_id,
+            BatchRecord.record_index > after_index,
+        )
+        .order_by(BatchRecord.record_index)
+        .limit(limit)
+    )
+    return [(int(idx), record) for idx, record in rows]
 
 
 def list_registered_batches(db: Session) -> list[BatchSummaryOut]:

@@ -58,6 +58,34 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
   下游读取返回 404；`PASSED` 批次才在同一事务内登记批次与全部明细。
 - **schema 版本**：每个批次显式携带 `schema_version`，登记与查询均按版本记录。
 
+## 四之二、下游读取采用流式输出
+
+`GET /batches/{batch_id}` 不再先把整批明细读进内存再序列化，而是**按页读库、边读边编码边发送**：
+
+| 关注点 | 实现 |
+| --- | --- |
+| 首段先到 | 先发批次头 `{batch_id,...,"records":[`，再发首页明细（`DQG_STREAM_FIRST_SEGMENT_RECORDS`，默认 20 行），不等整批读完 |
+| 内存不随行数增长 | 每页只取 `DQG_STREAM_PAGE_SIZE`（默认 500）行；按记录逐条编码，攒到 `DQG_STREAM_CHUNK_BYTES`（默认 64 KiB）即发送并丢弃 |
+| 不长期占用读事务 | 每页用独立 Session，keyset 分页（`record_index > cursor`），读完立即关闭；向下游阻塞发送期间不持有 SQLite 读事务，其他批次可继续登记，WAL 可检查点回收 |
+| 失败不交付“缺行的完整 JSON” | 每条记录校验 `record_index` 从 0 连续递增、总数等于登记时的 `record_count`；读库或编码异常会中止连接，**不会**补发收尾的 `]}`，客户端只能得到传输错误/不完整 JSON |
+| 客户端断开释放资源 | 生成器被取消/关闭时清理缓冲；每页数据库连接已在工作线程内关闭 |
+| 兼容性 | 输出与原先 `RegisteredBatchOut` 的默认编码**逐字节一致**（紧凑分隔符、`ensure_ascii=False`、字段顺序与取值不变）；未登记批次仍在响应开始前返回 404 |
+
+可调环境变量：`DQG_STREAM_PAGE_SIZE`、`DQG_STREAM_CHUNK_BYTES`、
+`DQG_STREAM_FIRST_SEGMENT_RECORDS`、`DQG_DEMO_ENABLED`（均为演示/调优用，
+`Dockerfile` 与 `docker-compose.yml` 已给出默认值）。
+
+### 在 /docs 中演示
+
+`docker compose up --build -d` 后打开 <http://localhost:8000/docs>，使用 **demo** 分组：
+
+1. `POST /demo/batches?records=20000` 生成并登记一个大批次，返回三个演示 URL；
+2. `GET /demo/batches/{batch_id}/slow?delay_ms=300`：慢速接收（每个 chunk 前等待），
+   期间可并行调用 `POST /demo/batches` 登记新批次、`POST /demo/db/checkpoint` 观察 WAL 可回收；
+3. `GET /demo/batches/{batch_id}/fail?after_records=30`：输出若干条后中止，验证拿不到完整 JSON；
+4. `GET /demo/batches/{batch_id}/head?bytes=200`：只读取响应前缀即关闭，证明首段无需等整批；
+5. `GET /demo/metrics`：查看页/块/内存上界等运行指标。
+
 ## 五、请求示例
 
 ```bash
@@ -71,18 +99,23 @@ curl -X POST http://localhost:8000/batches/submit \
 
 ```
 app/
-  main.py        # FastAPI 入口（lifespan 建表）
-  config.py      # 环境变量配置
+  main.py        # FastAPI 入口（lifespan 建表；DQG_DEMO_ENABLED 时挂载 demo 路由）
+  config.py      # 环境变量配置（含流式分页/块大小）
   database.py    # SQLAlchemy 引擎/会话/SQLite PRAGMA
   models.py      # ORM：submissions / batches / batch_records
   schemas.py     # Pydantic 请求与报告模型
   validation.py  # 纯函数校验引擎（三类规则）
-  services.py    # 幂等提交、事务登记、查询
+  services.py    # 幂等提交、事务登记、批次元数据与按键集分页查询
+  streaming.py   # 流式读取与增量 JSON 编码（首段、常量内存、短读事务、完整性校验）
   routers.py     # HTTP 路由
+  demo.py        # 演示路由：大批次、慢速接收、中途失败、WAL 检查点、指标
 data/
   rule_catalog.json     # 规则目录
   sample_payloads.json  # 示例数据
-tests/test_api.py       # 接口自测（pytest + TestClient）
+tests/test_api.py         # 接口自测（pytest + TestClient）
+tests/test_streaming.py   # 流式语义自测（结构一致、首段、内存、短事务、失败/断开）
+tests/test_demo.py        # 演示路由自测
+tests/test_concurrency.py # 并发幂等自测
 ```
 
 ## 七、自测
@@ -91,3 +124,8 @@ tests/test_api.py       # 接口自测（pytest + TestClient）
 pip install -r requirements.txt pytest httpx
 pytest tests/ -v
 ```
+
+`tests/test_streaming.py` 覆盖：与旧编码逐字节一致、字段/下标顺序、空批次、
+首段先于后续页发出、峰值内存不随行数线性增长、每页短事务、
+慢速下游期间 WAL 可截断检查点且其他批次可登记、中途失败不补收尾、
+落库缺行被检出、客户端断开清理。

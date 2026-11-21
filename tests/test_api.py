@@ -2,14 +2,11 @@
 from __future__ import annotations
 
 import json
-import os
-import tempfile
 
 import pytest
 
-# 使用独立临时数据库，避免污染开发库
-_TMP_DB = os.path.join(tempfile.mkdtemp(prefix="dqg-test-"), "test.db")
-os.environ["DQG_DB_PATH"] = _TMP_DB
+# 测试数据库由 tests/conftest.py 在任何 app 模块导入前统一设置，
+# 避免污染开发库，也保证多个测试模块共享同一临时库。
 
 from fastapi.testclient import TestClient  # noqa: E402
 
@@ -197,6 +194,28 @@ def test_batch_threshold_failure_rate() -> None:
 def test_unknown_submission_404() -> None:
     assert client.get("/submissions/nope").status_code == 404
     assert client.get("/batches/nope").status_code == 404
+
+
+def test_streamed_batch_endpoint_matches_documented_shape() -> None:
+    """HTTP 层流式输出仍保持原结构：200 + application/json + 完整可解析 JSON。"""
+    r = client.get("/batches/test-valid-1")
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("application/json")
+    body = r.json()
+    assert list(body) == [
+        "batch_id",
+        "schema_version",
+        "record_count",
+        "registered_at",
+        "records",
+    ]
+    assert body["record_count"] == 2
+    assert [rec["record_index"] for rec in body["records"]] == [0, 1]
+    assert body["records"][0]["record"]["order_id"] == "ORD-1001"
+    # 与旧的一次性加载结果逐字节一致
+    assert r.content == json.dumps(
+        body, ensure_ascii=False, allow_nan=False, separators=(",", ":")
+    ).encode("utf-8")
 
 
 def test_bad_rule_params_rejected_by_pydantic() -> None:
